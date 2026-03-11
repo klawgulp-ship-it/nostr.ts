@@ -25,6 +25,7 @@ import * as csp from "@blowater/csp";
 import { getSpaceMembers, prepareSpaceMember } from "./space-member.ts";
 import { assertEquals } from "@std/assert";
 import type { Event_V2, Signer_V2, SpaceMember } from "./v2.ts";
+import { Negentropy, type NegentropyItem } from "./negentropy.ts";
 
 export class WebSocketClosed extends Error {
     constructor(
@@ -93,6 +94,11 @@ export class SubscriptionAlreadyExist extends Error {
 export type SubscriptionStream = {
     filters: NostrFilter[];
     chan: csp.Channel<RelayResponse_REQ_Message>;
+};
+
+export type NegentropySync = {
+    have: string[];
+    need: string[];
 };
 
 /**
@@ -219,455 +225,373 @@ export class SingleRelayConnection implements Subscriber, SubscriptionCloser, Ev
                         relayResponse[0] === "EOSE"
                     ) {
                         const subID = relayResponse[1];
-                        const subscription = this.subscriptionMap.get(
-                            subID,
-                        );
-                        if (subscription === undefined) {
-                            // the subscription has been closed locally before receiving remote messages
-                            // or the relay sends to the wrong connection
+                        const stream = this.subscriptionMap.get(subID);
+                        if (stream == undefined) {
+                            // This can happen when the subscription is closed
+                            // but the relay sends a message before it receives the CLOSE
                             continue;
                         }
-                        const chan = subscription.chan;
-                        if (!chan.closed()) {
-                            if (relayResponse[0] === "EOSE") {
-                                chan.put({
-                                    type: relayResponse[0],
-                                    subID: relayResponse[1],
-                                });
-                            } else {
-                                chan.put({
-                                    type: relayResponse[0],
-                                    subID: relayResponse[1],
-                                    event: relayResponse[2],
-                                });
+                        if (relayResponse[0] === "EVENT") {
+                            const err = await stream.chan.put({
+                                type: "EVENT",
+                                subID,
+                                event: relayResponse[2],
+                            });
+                            if (err instanceof csp.PutToClosedChannelError) {
+                                console.error(err);
+                            }
+                        } else {
+                            const err = await stream.chan.put({
+                                type: "EOSE",
+                                subID,
+                            });
+                            if (err instanceof csp.PutToClosedChannelError) {
+                                console.error(err);
                             }
                         }
-                    } else if (relayResponse[0] == "OK") {
-                        const resolver = this.send_promise_resolvers.get(relayResponse[1]);
-                        if (resolver) {
-                            const ok = relayResponse[2];
-                            const message = relayResponse[3];
-                            resolver({ ok, message });
-                        }
-                    } else {
-                        for (const sub of this.subscriptionMap.values()) {
-                            sub.chan.put({
+                    } else if (relayResponse[0] === "NOTICE") {
+                        for (const stream of this.subscriptionMap.values()) {
+                            const err = await stream.chan.put({
                                 type: "NOTICE",
                                 note: relayResponse[1],
                             });
+                            if (err instanceof csp.PutToClosedChannelError) {
+                                console.error(err);
+                            }
                         }
-                        console.log(url, relayResponse); // NOTICE, OK and other non-standard response types
+                    } else if (relayResponse[0] === "OK") {
+                        const resolver = this.send_promise_resolvers.get(relayResponse[1]);
+                        if (resolver) {
+                            resolver({ ok: relayResponse[2], message: relayResponse[3] });
+                            this.send_promise_resolvers.delete(relayResponse[1]);
+                        }
+                    } else if (relayResponse[0] === "AUTH") {
+                        if (this.signer == undefined) {
+                            continue;
+                        }
+                        const challenge = relayResponse[1];
+                        if (this.ws == undefined) {
+                            console.error("impossible state");
+                            continue;
+                        }
+                        const event = await prepareNostrEvent(this.signer, {
+                            kind: NostrKind.HTTP_AUTH,
+                            content: "",
+                            tags: [
+                                ["relay", this.url.toString()],
+                                ["challenge", challenge],
+                            ],
+                        });
+                        if (event instanceof Error) {
+                            console.error(event);
+                            continue;
+                        }
+                        const err = await this.ws.send(JSON.stringify(["AUTH", event]));
+                        if (err instanceof Error) {
+                            console.error(err);
+                        }
                     }
                 }
             }
-        })().then((res) => {
-            if (res instanceof RelayDisconnectedByClient) {
-                if (this.log) {
-                    console.log(res);
-                }
-                return;
-            }
-            if (res instanceof Error) {
-                this.error = res;
-            } else {
-                console.error(res);
-            }
-        });
+        })();
     }
 
-    public static New(
-        urlString: string,
+    static New(
+        url: string | URL,
         args?: {
             wsCreator?: (url: string, log: boolean) => BidirectionalNetwork | Error;
-            connect?: boolean;
             log?: boolean;
-            signer?: Signer; // used for authentication
-            signer_v2?: Signer_V2; // used for sign event v2
+            signer?: Signer;
+            signer_v2?: Signer_V2;
         },
-    ): SingleRelayConnection | TypeError {
-        if (args == undefined) {
-            args = {};
+    ) {
+        let theURL: URL;
+        if (typeof url == "string") {
+            const _url = newURL(url);
+            if (_url instanceof TypeError) {
+                return _url;
+            }
+            theURL = _url;
+        } else {
+            theURL = url;
         }
-        try {
-            if (!urlString.startsWith("wss://") && !urlString.startsWith("ws://")) {
-                urlString = "wss://" + urlString;
-            }
-            if (args.wsCreator == undefined) {
-                args.wsCreator = AsyncWebSocket.New;
-            }
-            const url = newURL(urlString);
-            if (url instanceof TypeError) {
-                return url;
-            }
-            return new SingleRelayConnection(
-                url,
-                args.wsCreator,
-                args.log || false,
-                args.signer,
-                args.signer_v2,
-            );
-        } catch (e) {
-            if (e instanceof Error) {
-                return e;
-            } else {
-                throw e; // impossible
-            }
-        }
+        return new SingleRelayConnection(
+            theURL,
+            args?.wsCreator || AsyncWebSocket.New,
+            args?.log || false,
+            args?.signer,
+            args?.signer_v2,
+        );
     }
 
-    async newSub(subID: string, ...filters: NostrFilter[]) {
-        if (this.error instanceof AuthError) {
-            return this.error;
-        }
-        if (this.log) {
-            console.log(`${this.url} registers subscription ${subID}`, ...filters);
-        }
-
-        const subscription = this.subscriptionMap.get(subID);
-        if (subscription !== undefined) {
+    async newSub(
+        subID: string,
+        ...filters: NostrFilter[]
+    ): Promise<SubscriptionStream | SubscriptionAlreadyExist | WebSocketClosed> {
+        if (this.subscriptionMap.has(subID)) {
             return new SubscriptionAlreadyExist(subID, this.url.toString());
         }
-
-        if (this.ws != undefined) {
+        const c = csp.chan<RelayResponse_REQ_Message>();
+        this.subscriptionMap.set(subID, { filters, chan: c });
+        if (this.ws != undefined && this.ws.status() == "Open") {
             const err = await sendSubscription(this.ws, subID, ...filters);
             if (err instanceof Error) {
-                console.error(err);
+                return err;
             }
         }
-
-        const chan = csp.chan<RelayResponse_REQ_Message>();
-        this.subscriptionMap.set(subID, { filters, chan });
-        return { filters, chan };
-    }
-
-    async sendEvent(event: NostrEvent) {
-        if (this.ws == undefined) {
-            return new WebSocketClosed(this.url.toString(), this.status());
-        }
-        if (this.error) {
-            return this.error;
-        }
-        const err = await this.ws.send(JSON.stringify([
-            "EVENT",
-            event,
-        ]));
-        if (err instanceof Error) {
-            return err;
-        }
-
-        const res = await new Promise<{ ok: boolean; message: string }>(
-            (resolve) => {
-                this.send_promise_resolvers.set(event.id, resolve);
-            },
-        );
-        if (!res.ok) {
-            return new RelayRejectedEvent(res.message, event);
-        }
-        return res.message;
-    }
-
-    async getEvent(id: NoteID | string) {
-        if (this.error) {
-            return this.error;
-        }
-        if (id instanceof NoteID) {
-            id = id.hex;
-        }
-
-        const err = await this.closeSub(id);
-        if (err instanceof Error) return err;
-
-        const events = await this.newSub(id, { ids: [id] });
-        if (events instanceof Error) {
-            return events;
-        }
-        for await (const msg of events.chan) {
-            const err = await this.closeSub(id);
-            if (err instanceof Error) return err;
-
-            if (msg.type == "EVENT") {
-                return msg.event;
-            } else if (msg.type == "NOTICE") {
-                // todo: give a concrete type
-                return new Error(msg.note);
-            } else if (msg.type == "EOSE") {
-                return;
-            }
-        }
-    }
-
-    async getReplaceableEvent(pubkey: PublicKey, kind: NostrKind) {
-        const subID = `${pubkey.bech32()}:${kind}`;
-        const err = await this.closeSub(subID);
-        if (err instanceof Error) return err;
-
-        const events = await this.newSub(subID, {
-            authors: [pubkey.hex],
-            kinds: [kind],
-            limit: 1,
-        });
-        if (events instanceof Error) {
-            return events;
-        }
-        for await (const msg of events.chan) {
-            const err = await this.closeSub(subID);
-            if (err instanceof Error) return err;
-
-            if (msg.type == "EVENT") {
-                return msg.event;
-            } else if (msg.type == "NOTICE") {
-                return new Error(msg.note);
-            } else if (msg.type == "EOSE") {
-                return;
-            }
-        }
+        return { filters, chan: c };
     }
 
     async closeSub(subID: string) {
-        let err;
-        if (this.ws != undefined) {
-            err = await this.ws.send(JSON.stringify([
-                "CLOSE",
-                subID, // multiplex marker / channel
-            ]));
-        }
-
-        const subscription = this.subscriptionMap.get(subID);
-        if (subscription === undefined) {
+        const stream = this.subscriptionMap.get(subID);
+        if (stream == undefined) {
             return;
         }
-
-        try {
-            await subscription.chan.close();
-        } catch (e) {
-            if (!(e instanceof csp.CloseChannelTwiceError)) {
-                throw e;
-            }
-        }
         this.subscriptionMap.delete(subID);
-        return err;
-    }
-
-    close = async (force?: boolean) => {
-        this._isClosedByClient = true;
-        for (const [subID, { chan }] of this.subscriptionMap.entries()) {
-            if (chan.closed()) {
-                continue;
-            }
-            await this.closeSub(subID);
+        const err = stream.chan.close();
+        if (err instanceof csp.CloseChannelError) {
+            console.error(err);
         }
-        if (this.ws) {
-            await this.ws.close(undefined, undefined, force ? true : false);
-        }
-        // the WebSocket constructor is async underneath but since it's too old,
-        // it does not have an awaitable interface so that exiting the program may cause
-        // unresolved event underneath
-        // this is a quick & dirty way for me to address it
-        // old browser API sucks
-        await csp.sleep(1);
-        if (this.log) {
-            console.log(`relay ${this.url} closed, status: ${this.status()}`);
-        }
-    };
-
-    [Symbol.asyncDispose] = () => {
-        return this.close();
-    };
-
-    isClosed(): boolean {
         if (this.ws == undefined) {
-            return true;
+            return;
         }
-        return this.ws.status() == "Closed" || this.ws.status() == "Closing";
+        const sendErr = await this.ws.send(JSON.stringify(["CLOSE", subID]));
+        if (sendErr instanceof Error) {
+            return sendErr;
+        }
     }
 
-    private async connect() {
-        if (this.error instanceof Error) {
-            return this.error;
+    async sendEvent(nostrEvent: NostrEvent) {
+        if (this.ws == undefined) {
+            return new WebSocketClosed(this.url, "Closed");
         }
-        let ws: BidirectionalNetwork | Error | undefined;
-        for (;;) {
-            if (this.log) {
-                console.log(`(re)connecting ${this.url}`);
+        if (this.ws.status() != "Open") {
+            return new WebSocketClosed(this.url, this.ws.status());
+        }
+        return new Promise<{ ok: boolean; message: string }>((resolve) => {
+            this.send_promise_resolvers.set(nostrEvent.id, resolve);
+            if (this.ws == undefined) {
+                resolve({ ok: false, message: "ws is undefined" });
+                return;
             }
-            if (this.isClosedByClient()) {
-                return new RelayDisconnectedByClient();
-            }
-            if (this.ws) {
-                const status = this.ws.status();
-                if (status == "Connecting" || status == "Open") {
-                    return this.ws;
+            this.ws.send(JSON.stringify(["EVENT", nostrEvent])).then((err) => {
+                if (err instanceof Error) {
+                    resolve({ ok: false, message: err.message });
                 }
+            });
+        });
+    }
+
+    isClosed() {
+        return this._isClosedByClient || this.ws?.status() == "Closed";
+    }
+
+    async close() {
+        this._isClosedByClient = true;
+        if (this.ws == undefined) {
+            return;
+        }
+        // close all sub channels
+        for (const [subID, _] of this.subscriptionMap.entries()) {
+            const stream = this.subscriptionMap.get(subID);
+            if (stream == undefined) {
+                continue;
+            }
+            this.subscriptionMap.delete(subID);
+            stream.chan.close();
+        }
+        const err = await this.ws.close();
+        if (err instanceof CloseTwice) {
+            // don't care
+        } else if (err instanceof Error) {
+            console.error(err);
+        }
+    }
+
+    async getEvent(id: NoteID | string): Promise<NostrEvent | undefined | Error> {
+        if (id instanceof NoteID) {
+            id = id.hex;
+        }
+        const stream = await this.newSub(id, { "ids": [id] });
+        if (stream instanceof Error) {
+            return stream;
+        }
+        for await (const msg of stream.chan) {
+            if (msg.type == "EOSE") {
+                await this.closeSub(id);
+                return undefined;
+            } else if (msg.type == "EVENT") {
+                await this.closeSub(id);
+                return msg.event;
+            }
+        }
+    }
+
+    async getRelayInformation(): Promise<RelayInformation | RESTRequestFailed | Error> {
+        const httpURL = new URL(this.url.toString());
+        if (httpURL.protocol == "wss:") {
+            httpURL.protocol = "https:";
+        } else {
+            httpURL.protocol = "http:";
+        }
+        return getRelayInformation(httpURL.toString());
+    }
+
+    async getSpaceMembers(publicKey: PublicKey): Promise<SpaceMember[] | Error> {
+        return getSpaceMembers(this, publicKey);
+    }
+
+    /**
+     * Synchronize events with the relay using the Negentropy protocol.
+     * Returns the list of event IDs the client needs from the relay (need)
+     * and the list of event IDs the relay needs from the client (have).
+     *
+     * @param filter - The subscription filter defining the range to sync
+     * @param localItems - The local events the client already has
+     */
+    async negentropySync(
+        subID: string,
+        filter: NostrFilter,
+        localItems: NegentropyItem[],
+    ): Promise<NegentropySync | Error> {
+        if (this.ws == undefined || this.ws.status() != "Open") {
+            return new WebSocketClosed(this.url, this.ws?.status() ?? "Closed");
+        }
+
+        const neg = new Negentropy();
+        for (const item of localItems) {
+            neg.addItem(item.created_at, item.id);
+        }
+        neg.seal();
+
+        const initialMsg = neg.initiate();
+
+        // Send NEG-OPEN
+        const openMsg = JSON.stringify(["NEG-OPEN", subID, filter, initialMsg]);
+        const sendErr = await this.ws.send(openMsg);
+        if (sendErr instanceof Error) {
+            return sendErr;
+        }
+
+        const have: string[] = [];
+        const need: string[] = [];
+
+        // Process NEG-MSG responses until done
+        for (;;) {
+            const message = await this.nextMessage(this.ws);
+            if (message.type !== "messsage") {
+                return new Error(`unexpected message type during negentropy sync: ${message.type}`);
             }
 
-            if (this.signer) {
-                this.url.searchParams.set(
-                    "auth",
-                    btoa(JSON.stringify(
-                        await prepareNostrEvent(this.signer, {
-                            kind: NostrKind.HTTP_AUTH,
-                            content: "",
-                        }),
-                    )),
-                );
+            const parsed = parseJSON<unknown[]>(message.data);
+            if (parsed instanceof Error) {
+                return parsed;
             }
-            ws = this.wsCreator(this.url.toString(), this.log);
-            if (ws instanceof Error) {
-                console.error(ws.name, ws.message, ws.cause);
-                if (ws.name == "SecurityError") {
-                    return ws;
+
+            if (!Array.isArray(parsed) || parsed.length < 2) {
+                continue;
+            }
+
+            const msgType = parsed[0];
+            const msgSubID = parsed[1];
+
+            if (msgSubID !== subID) {
+                continue;
+            }
+
+            if (msgType === "NEG-ERR") {
+                const closeErr = await this.ws.send(JSON.stringify(["NEG-CLOSE", subID]));
+                if (closeErr instanceof Error) {
+                    console.error(closeErr);
+                }
+                return new Error(`NEG-ERR from relay: ${parsed[2]}`);
+            }
+
+            if (msgType === "NEG-HAVE") {
+                // Relay has these IDs that the client doesn't have
+                const ids = parsed[2] as string[];
+                for (const id of ids) {
+                    need.push(id);
                 }
                 continue;
             }
-            break;
+
+            if (msgType === "NEG-NEED") {
+                // Client has these IDs that the relay doesn't have
+                const ids = parsed[2] as string[];
+                for (const id of ids) {
+                    have.push(id);
+                }
+                continue;
+            }
+
+            if (msgType === "NEG-MSG") {
+                const replyMsg = parsed[2] as string;
+                const result = neg.reconcile(replyMsg);
+
+                for (const id of result.have) {
+                    have.push(id);
+                }
+                for (const id of result.need) {
+                    need.push(id);
+                }
+
+                if (result.output === null) {
+                    // Sync is complete
+                    const closeErr = await this.ws.send(JSON.stringify(["NEG-CLOSE", subID]));
+                    if (closeErr instanceof Error) {
+                        console.error(closeErr);
+                    }
+                    return { have, need };
+                }
+
+                // Send next round
+                const nextMsg = JSON.stringify(["NEG-MSG", subID, result.output]);
+                const err = await this.ws.send(nextMsg);
+                if (err instanceof Error) {
+                    return err;
+                }
+                continue;
+            }
+        }
+    }
+
+    private async connect(): Promise<BidirectionalNetwork | RelayDisconnectedByClient | Error> {
+        if (this._isClosedByClient) {
+            return new RelayDisconnectedByClient();
+        }
+        const ws = this.wsCreator(this.url.toString(), this.log);
+        if (ws instanceof Error) {
+            return ws;
         }
         this.ws = ws;
-        return this.ws;
+        const err = await ws.untilOpen();
+        if (err instanceof WebSocketClosed) {
+            return err;
+        }
+        return ws;
     }
 
     private async nextMessage(ws: BidirectionalNetwork): Promise<NextMessageType> {
-        if (this.isClosedByClient()) {
-            return {
-                type: "RelayDisconnectedByClient",
-                error: new RelayDisconnectedByClient(),
-            };
-        }
-        const message = await ws.nextMessage();
-        return message;
+        return ws.nextMessage();
     }
-
-    unstable = {
-        /**
-         * before we have relay info as events,
-         * let's pull it periodically to have an async iterable API
-         */
-        getRelayInformationStream: () => {
-            const chan = csp.chan<Error | RelayInformation>();
-            (async () => {
-                let spaceInformation: RelayInformation | Error | undefined;
-                for (;;) {
-                    if (chan.closed()) return;
-                    const info = await this.unstable.getSpaceInformation();
-                    if (info instanceof Error || !deepEqual(spaceInformation, info)) {
-                        spaceInformation = info;
-                        const err = await chan.put(info);
-                        if (err instanceof Error) {
-                            // the channel is closed by outside, stop the stream
-                            return;
-                        }
-                    }
-                    await sleep(3000); // every 3 sec
-                }
-            })();
-            return chan;
-        },
-        postEventV2: async (event: Event_V2): Promise<Error | Response> => {
-            const httpURL = new URL(this.url);
-            httpURL.protocol = httpURL.protocol == "wss:" ? "https" : "http";
-            try {
-                return await fetch(httpURL, { method: "POST", body: JSON.stringify(event) });
-            } catch (e) {
-                return e as Error;
-            }
-        },
-        /**
-         * v2 API, unstable
-         * add a public key to this relay as its member
-         */
-        addSpaceMember: async (member: PublicKey | string): Promise<Error | Response> => {
-            if (!this.signer_v2) {
-                return new SignerV2NotExist();
-            }
-            const spaceMemberEvent = await prepareSpaceMember(this.signer_v2, member);
-            if (spaceMemberEvent instanceof Error) {
-                return spaceMemberEvent;
-            }
-            return await this.unstable.postEventV2(spaceMemberEvent);
-        },
-        /**
-         * v2 API, unstable
-         * a stream of space members
-         */
-        getSpaceMembersStream: () => {
-            const chan = csp.chan<
-                RESTRequestFailed | TypeError | SyntaxError | Error | SpaceMember[]
-            >();
-            (async () => {
-                let spaceMembers:
-                    | SpaceMember[]
-                    | RESTRequestFailed
-                    | TypeError
-                    | SyntaxError
-                    | Error
-                    | undefined;
-                for (;;) {
-                    if (chan.closed()) return;
-                    const members = await getSpaceMembers(this.url);
-                    if (members instanceof Error) {
-                        if (members instanceof RESTRequestFailed) {
-                            if (members.res.status == 404) {
-                                await chan.put(members);
-                                await chan.close();
-                            } else {
-                                await chan.put(members);
-                            }
-                        } else {
-                            await chan.put(members);
-                        }
-                    } else if (!deepEqual(spaceMembers, members)) {
-                        spaceMembers = members;
-                        const err = await chan.put(members);
-                        if (err instanceof Error) {
-                            // the channel is closed by outside, stop the stream
-                            return;
-                        }
-                    }
-                    await sleep(3000); // every 3 sec
-                }
-            })();
-            return chan;
-        },
-        getSpaceInformation: () => {
-            return getRelayInformation(this.url);
-        },
-    };
 }
 
-async function sendSubscription(ws: BidirectionalNetwork, subID: string, ...filters: NostrFilter[]) {
+async function sendSubscription(
+    ws: BidirectionalNetwork,
+    subID: string,
+    ...filters: NostrFilter[]
+) {
     const req: ClientRequest_REQ = ["REQ", subID, ...filters];
     const err = await ws.send(JSON.stringify(req));
-    if (err) {
+    if (err instanceof Error) {
         return err;
-    }
-}
-
-export class RelayRejectedEvent extends Error {
-    constructor(msg: string, public readonly event: NostrEvent) {
-        super(`${event.id}: ${msg}`);
-        this.name = RelayRejectedEvent.name;
     }
 }
 
 export class AuthError extends Error {
-    constructor(msg: string) {
-        super(msg);
+    constructor(reason: string) {
+        super(reason);
         this.name = AuthError.name;
-    }
-}
-
-export class SignerV2NotExist extends Error {
-    constructor() {
-        super(`Signer V2 does not exist`);
-        this.name = SignerV2NotExist.name;
-    }
-}
-
-// deno-lint-ignore no-explicit-any
-function deepEqual(a: any, b: any) {
-    try {
-        assertEquals(a, b);
-        return true;
-    } catch {
-        return false;
     }
 }
